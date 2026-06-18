@@ -84,18 +84,17 @@ defmodule EctoUnnest.Query do
 
   defp source(arrays) do
     aliases = Enum.map_join(arrays, ", ", &~s|"#{&1.name}"|)
+    len = length(arrays)
 
     parts =
       [raw: "(SELECT * FROM unnest("] ++
         (arrays
          |> Enum.with_index()
          |> Enum.flat_map(fn {c, i} ->
-           tail =
-             if i == length(arrays) - 1,
-               do: "::#{c.pg_type}[]) AS u(#{aliases}))",
-               else: "::#{c.pg_type}[], "
+           type = "::#{c.pg_type}[]"
+           tail = if i == len - 1, do: ") AS u(#{aliases}))", else: ", "
 
-           [expr: {:^, [], [i]}, raw: tail]
+           [expr: {:^, [], [i]}, raw: [type, tail]]
          end))
 
     {:fragment, [], parts}
