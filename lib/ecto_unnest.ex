@@ -45,7 +45,13 @@ defmodule EctoUnnest do
     * `:types` — `%{col => pg_type}` override for type inference, where `pg_type` is
       an atom (recommended — assumed app-controlled, so rendered straight into the
       SQL cast) or a string. For a placeholder it becomes a raw `::pg_type` cast, so
-      it can name a custom PG type (e.g. a domain `:kafka_topic_name`)
+      it can name a custom PG type (e.g. a domain `:kafka_topic_name`). The value is
+      rendered into SQL verbatim, so it is fail-closed: Ecto's default PG types
+      (`bigint`, `text`, `jsonb`, `timestamptz`, …) are always accepted, but any
+      other spelling (a domain, an alias like `int4`, a modifier like `numeric(10,2)`)
+      must be vouched for in config, or it raises:
+
+          config :ecto_unnest, :allowed_types, [:int4, "kafka_topic_name"]
     * `:json` — `[col]` columns to force into JSON mode (see "JSON columns" below)
 
   ## JSON columns
@@ -221,7 +227,7 @@ defmodule EctoUnnest do
     (array_cols ++ scalar_cols)
     |> Enum.sort_by(fn {name, _} -> name end)
     |> Enum.map(fn {name, kind} ->
-      override = normalize_type(overrides[name])
+      override = normalize_type(name, overrides[name])
       ecto_type = EctoUnnest.Types.ecto_type!(schema, name, override)
       classify_column!(schema, name, kind, ecto_type, override, columns, MapSet.member?(json_opt, name))
     end)
@@ -267,9 +273,42 @@ defmodule EctoUnnest do
 
   # `:types` may be an atom (recommended — app-controlled, so it is safe to render
   # straight into the SQL cast) or a string. Normalize to a string for rendering.
-  defp normalize_type(nil), do: nil
-  defp normalize_type(t) when is_atom(t), do: Atom.to_string(t)
-  defp normalize_type(t) when is_binary(t), do: t
+  defp normalize_type(_name, nil), do: nil
+  defp normalize_type(name, t) when is_atom(t), do: validate_type!(name, Atom.to_string(t))
+  defp normalize_type(name, t) when is_binary(t), do: validate_type!(name, t)
+
+  # The override is rendered straight into the SQL cast (`$n::type` / `::type[]`),
+  # so as a defence-in-depth guard against injection we accept only a well-formed
+  # PostgreSQL type spelling, not just a safe character set: a (possibly
+  # multi-word, schema-qualified) base name, an optional `(...)` modifier whose
+  # parens must close, and zero or more `[]`/`[n]` array suffixes whose brackets
+  # must close. Covers `kafka_topic_name`, `bigint[]`, `numeric(10,2)`,
+  # `timestamp with time zone`, `public.mytype`. A stray `int4)` or `bigint[`,
+  # or any other char (`;`, quotes, `-`, `\`, …), is rejected.
+  # A `:types` override is rendered into SQL verbatim, so it is fail-closed: a
+  # spelling is allowed only if it is one of Ecto's default PG types or the app has
+  # vouched for it via `config :ecto_unnest, :allowed_types`. Anything else raises.
+  defp validate_type!(name, type) do
+    if type in allowed_types() do
+      type
+    else
+      raise ArgumentError,
+            ":types value #{inspect(type)} for column #{inspect(name)} is not allowed — it is not a " <>
+              "default Ecto type; add it to `config :ecto_unnest, :allowed_types, [...]`"
+    end
+  end
+
+  # Default PG types (always allowed) plus the configured custom ones. Config
+  # entries may be atoms or strings; normalized to strings to match the cast.
+  defp allowed_types do
+    configured =
+      case Application.get_env(:ecto_unnest, :allowed_types) do
+        nil -> []
+        list -> Enum.map(list, &to_string/1)
+      end
+
+    EctoUnnest.Types.default_pg_types() ++ configured
+  end
 
   defp encode_json(nil), do: nil
   defp encode_json(v) when is_binary(v), do: v

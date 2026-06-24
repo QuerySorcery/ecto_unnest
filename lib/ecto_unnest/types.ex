@@ -41,6 +41,14 @@ defmodule EctoUnnest.Types do
   def jsonb?({:parameterized, _, _} = t), do: jsonb?(primitive(t))
   def jsonb?(_), do: false
 
+  # The canonical PG type names `map_pg/1` emits — the set of types Ecto's own
+  # type inference produces, always allowed for a `:types` override without needing
+  # `config :ecto_unnest, :allowed_types`. Keep in sync with `map_pg/1`.
+  @default_pg_types ~w(bigint float8 boolean text bytea uuid numeric date time timestamp timestamptz jsonb json)
+
+  @doc "PG type names always allowed for a `:types` override (see `EctoUnnest`'s `:allowed_types`)."
+  def default_pg_types, do: @default_pg_types
+
   @doc """
   `{:ok, "pg_type"}` or `{:error, :array_unsupported}`.
 
