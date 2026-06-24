@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-06-24
 
 ### Added
 
@@ -14,8 +14,19 @@
 - **Full `Ecto.Query` as `:on_conflict`.** Enables a conditional
   `ON CONFLICT ... DO UPDATE SET ... WHERE <predicate>` (and `ORDER BY`), matching
   `Ecto.Repo.insert_all/3`.
-- **`:types` accepts atoms** (recommended — assumed app-controlled, so rendered
-  straight into the SQL cast). Strings still work.
+- **`:types` accepts atoms** as well as strings.
+- **`config :ecto_unnest, :allowed_types`** — an explicit allow-list of custom PG
+  types permitted in a `:types` override.
+
+### Security
+
+- **`:types` overrides are now fail-closed.** The value is rendered into the SQL
+  cast verbatim, so it is validated: Ecto's default PG types (`bigint`, `text`,
+  `jsonb`, `timestamptz`, …) are always allowed, but any other spelling (a domain,
+  an alias like `int4`, a modifier) must be listed in
+  `config :ecto_unnest, :allowed_types` or the call raises. Apps using `:types`
+  with non-default types (including binary sources, which require `:types`) must add
+  this config.
 
 ### Fixed
 

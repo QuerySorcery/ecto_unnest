@@ -147,6 +147,19 @@ defmodule EctoUnnest.QueryTest do
       {sql, _} = EctoUnnest.to_sql(Event, %{user_id: [1]}, types: %{user_id: :int4})
       assert sql =~ ~s|$1::int4[]|
     end
+
+    test "a default Ecto type is allowed with no extra config" do
+      {sql, _} = EctoUnnest.to_sql("t", %{c: [1]}, types: %{c: :bigint})
+      assert sql =~ ~s|$1::bigint[]|
+    end
+
+    test ":types not allowed (not default, not configured) raises" do
+      for bad <- ["int4); DROP TABLE t; --", "geometry", "citext"] do
+        assert_raise ArgumentError, ~r/is not allowed/, fn ->
+          EctoUnnest.to_sql("t", %{id: [1]}, types: %{id: bad})
+        end
+      end
+    end
   end
 
   describe "Gap 1 — per-row JSON columns" do

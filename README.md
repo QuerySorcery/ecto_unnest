@@ -60,7 +60,27 @@ It is pure (no database connection) and renders the exact statement
 | `:prefix` | schema prefix (overrides `@schema_prefix`) |
 | `:on_conflict` | `:raise \| :nothing \| :replace_all \| {:replace, fields} \| {:replace_all_except, fields} \| [set: kw, inc: kw]` |
 | `:conflict_target` | `[col] \| {:unsafe_fragment, binary}` |
-| `:types` | `%{col => "pg_type"}` override for inference |
+| `:types` | `%{col => pg_type}` override for inference (atom or string — see [Type overrides](#type-overrides)) |
+
+## Type overrides and `:allowed_types`
+
+A `:types` value is rendered into the SQL cast (`$n::type` / `::type[]`)
+**verbatim**, so it must never come from user input. As a guard, the gate is
+fail-closed:
+
+- Ecto's **default PG types** (`bigint`, `float8`, `boolean`, `text`, `bytea`,
+  `uuid`, `numeric`, `date`, `time`, `timestamp`, `timestamptz`, `jsonb`, `json`)
+  are always accepted.
+- **Anything else** — a domain (`kafka_topic_name`), an alias (`int4`), a modifier
+  (`numeric(10,2)`), a quoted identifier — must be vouched for in config, or the
+  call raises:
+
+```elixir
+config :ecto_unnest, :allowed_types, [:int4, "kafka_topic_name"]
+```
+
+Entries may be atoms or strings. Because binary sources (`"table"`) require
+`:types`, any non-default type they cast to must be listed here.
 
 ## Reading: `unnest` as a virtual table
 
