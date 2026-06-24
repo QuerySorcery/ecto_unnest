@@ -1,6 +1,9 @@
 defmodule EctoUnnest.QueryTest do
   use ExUnit.Case, async: true
 
+  import Ecto.Query
+
+  alias EctoUnnest.Test.Doc
   alias EctoUnnest.Test.Event
   alias EctoUnnest.Test.WithUuid
 
@@ -135,9 +138,109 @@ defmodule EctoUnnest.QueryTest do
       assert sql =~ ~s|$1::text[]|
     end
 
-    test "override via :types" do
+    test "override via :types (string)" do
       {sql, _} = EctoUnnest.to_sql(Event, %{user_id: [1]}, types: %{user_id: "int4"})
       assert sql =~ ~s|$1::int4[]|
+    end
+
+    test "override via :types (atom — app-controlled)" do
+      {sql, _} = EctoUnnest.to_sql(Event, %{user_id: [1]}, types: %{user_id: :int4})
+      assert sql =~ ~s|$1::int4[]|
+    end
+  end
+
+  describe "Gap 1 — per-row JSON columns" do
+    test "schema {:array, :map} ships as text[] and projects ::jsonb" do
+      {sql, params} = EctoUnnest.to_sql(Doc, %{id: [1, 2], summary: [[%{"a" => 1}], [%{"b" => 2}]]})
+
+      assert sql ==
+               ~s|INSERT INTO "docs" ("id","summary") | <>
+                 ~s|(SELECT f0."id", f0."summary"::jsonb | <>
+                 ~s|FROM (SELECT * FROM unnest($1::bigint[], $2::text[]) AS u("id", "summary")) AS f0)|
+
+      # summary went in pre-encoded as a 1-D text[] (no multi-dimensional array)
+      assert params == [[1, 2], [~s|[{"a":1}]|, ~s|[{"b":2}]|]]
+    end
+
+    test "schema plain :map per-row column also routes through JSON mode" do
+      {sql, params} = EctoUnnest.to_sql(Doc, %{id: [1], meta: [%{"k" => "v"}]})
+      assert sql =~ ~s|f0."meta"::jsonb|
+      assert sql =~ ~s|unnest($1::bigint[], $2::text[])|
+      assert params == [[1], [~s|{"k":"v"}|]]
+    end
+
+    test "binary source with types: jsonb ships text[] + ::jsonb projection" do
+      {sql, params} =
+        EctoUnnest.to_sql("docs", %{id: [1], summary: [[%{"a" => 1}]]}, types: %{id: :bigint, summary: :jsonb})
+
+      assert sql =~ ~s|f0."summary"::jsonb|
+      assert sql =~ ~s|unnest($1::bigint[], $2::text[])|
+      assert params == [[1], [~s|[{"a":1}]|]]
+    end
+
+    test "explicit json: option opts a column into JSON mode" do
+      {sql, params} =
+        EctoUnnest.to_sql("docs", %{id: [1], summary: [%{"x" => 9}]},
+          types: %{id: :bigint, summary: :text},
+          json: [:summary]
+        )
+
+      assert sql =~ ~s|f0."summary"::jsonb|
+      assert params == [[1], [~s|{"x":9}|]]
+    end
+
+    test "pre-encoded JSON strings are passed through untouched" do
+      {_sql, params} =
+        EctoUnnest.to_sql("docs", %{id: [1], summary: [~s|[{"a":1}]|]}, types: %{id: :bigint, summary: :jsonb})
+
+      assert params == [[1], [~s|[{"a":1}]|]]
+    end
+  end
+
+  describe "Gap 2 — placeholder types" do
+    test "integer-backed Ecto.Enum placeholder works with no :types (schema source)" do
+      {sql, params} = EctoUnnest.to_sql(Doc, %{id: [1]}, placeholders: %{status: :published})
+
+      assert sql =~ ~s|SELECT f0."id", $1::bigint|
+      # :published dumps to its integer mapping (1) via the Ecto.Enum type
+      assert params == [1, [1]]
+    end
+
+    test "binary-source non-string placeholder casts via :types" do
+      now = ~U[2026-06-17 10:00:00Z]
+
+      {sql, params} =
+        EctoUnnest.to_sql("docs", %{id: [1]},
+          types: %{id: :bigint, created_at: :timestamptz},
+          placeholders: %{created_at: now}
+        )
+
+      assert sql =~ ~s|SELECT f0."id", $1::timestamptz|
+      assert params == [now, [1]]
+    end
+
+    test "custom PG type placeholder cast (atom :types) renders raw" do
+      {sql, _} =
+        EctoUnnest.to_sql("topics", %{id: [1]},
+          types: %{id: :bigint, topic: :kafka_topic_name},
+          placeholders: %{topic: "my.topic"}
+        )
+
+      assert sql =~ ~s|SELECT f0."id", $1::kafka_topic_name|
+    end
+  end
+
+  describe "Gap 4 — ON CONFLICT DO UPDATE ... WHERE" do
+    test "a full Ecto query threads its WHERE into the DO UPDATE" do
+      upd = from(e in Event, update: [set: [type: "revived"]], where: not is_nil(e.type))
+
+      {sql, _} =
+        EctoUnnest.to_sql(Event, %{user_id: [1], type: ["x"]},
+          on_conflict: upd,
+          conflict_target: [:user_id]
+        )
+
+      assert sql =~ ~s|ON CONFLICT ("user_id") DO UPDATE SET "type" = 'revived' WHERE (NOT (e0."type" IS NULL))|
     end
   end
 end
