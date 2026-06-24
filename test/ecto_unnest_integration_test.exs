@@ -3,6 +3,7 @@ defmodule EctoUnnest.IntegrationTest do
 
   import Ecto.Query
 
+  alias EctoUnnest.Test.Doc
   alias EctoUnnest.Test.Event
   alias EctoUnnest.Test.Repo
 
@@ -172,6 +173,135 @@ defmodule EctoUnnest.IntegrationTest do
         EctoUnnest.insert_all(Repo, WithUuidV7, %{id: ids, name: ["a", "b", "c"]}, returning: [:id, :name])
 
       assert Enum.sort(Enum.map(rows, & &1.id)) == Enum.sort(ids)
+    end
+  end
+
+  describe "Gap 1 — per-row JSON columns (execution)" do
+    test "schema {:array, :map} round-trips; id and other columns stay aligned" do
+      ts = ~U[2026-06-17 10:00:00Z]
+
+      {2, [a, b]} =
+        EctoUnnest.insert_all(
+          Repo,
+          Doc,
+          %{id: [101, 102], summary: [[%{"a" => 1}], [%{"b" => 2}, %{"c" => 3}]]},
+          placeholders: %{created_at: ts},
+          returning: [:id, :summary, :created_at]
+        )
+
+      [a, b] = Enum.sort_by([a, b], & &1.id)
+      assert a.id == 101
+      assert a.summary == [%{"a" => 1}]
+      assert a.created_at == ts
+      assert b.id == 102
+      assert b.summary == [%{"b" => 2}, %{"c" => 3}]
+    end
+
+    test "binary source with types: jsonb stores a list-valued jsonb, id not nulled" do
+      EctoUnnest.insert_all(
+        Repo,
+        "docs",
+        %{id: [201, 202], summary: [[%{"x" => 1}], [%{"y" => 2}]]},
+        types: %{id: :bigint, summary: :jsonb}
+      )
+
+      rows =
+        Doc
+        |> Repo.all()
+        |> Enum.filter(&(&1.id in [201, 202]))
+        |> Enum.sort_by(& &1.id)
+
+      assert Enum.map(rows, & &1.id) == [201, 202]
+      assert Enum.map(rows, & &1.summary) == [[%{"x" => 1}], [%{"y" => 2}]]
+    end
+
+    test "plain :map per-row column round-trips" do
+      {1, [doc]} =
+        EctoUnnest.insert_all(Repo, Doc, %{id: [301], meta: [%{"k" => "v"}]}, returning: [:id, :meta])
+
+      assert doc.meta == %{"k" => "v"}
+    end
+  end
+
+  describe "Gap 2 — placeholder types (execution)" do
+    test "integer-backed Ecto.Enum placeholder inserts its mapped value (no :types)" do
+      {1, [doc]} =
+        EctoUnnest.insert_all(Repo, Doc, %{id: [401]},
+          placeholders: %{status: :published},
+          returning: [:id, :status]
+        )
+
+      assert doc.status == :published
+      assert Repo.query!("SELECT status FROM docs WHERE id = 401").rows == [[1]]
+    end
+
+    test "binary-source datetime placeholder casts via :types" do
+      ts = ~U[2026-06-17 10:00:00Z]
+
+      EctoUnnest.insert_all(Repo, "docs", %{id: [501]},
+        types: %{id: :bigint, created_at: :timestamptz},
+        placeholders: %{created_at: ts}
+      )
+
+      assert Repo.get(Doc, 501).created_at == ts
+    end
+
+    test "custom PG domain placeholder cast (kafka_topic_name)" do
+      EctoUnnest.insert_all(Repo, "topics", %{id: [1, 2]},
+        types: %{id: :bigint, topic: :kafka_topic_name},
+        placeholders: %{topic: "orders.created"}
+      )
+
+      assert Repo.query!("SELECT id, topic FROM topics ORDER BY id").rows ==
+               [[1, "orders.created"], [2, "orders.created"]]
+    end
+  end
+
+  describe "Gap 3 — binary-source column alignment (execution)" do
+    test "values land in their named column even when map order ≠ physical order" do
+      # physical order: m_col, id, a_col, z_col, ph_col
+      EctoUnnest.insert_all(
+        Repo,
+        "scrambled",
+        %{m_col: ["m1", "m2"], id: [1, 2], a_col: ["a1", "a2"], z_col: ["z1", "z2"]},
+        types: %{m_col: :text, id: :bigint, a_col: :text, z_col: :text, ph_col: :text},
+        placeholders: %{ph_col: "PH"}
+      )
+
+      rows = Repo.query!("SELECT m_col, id, a_col, z_col, ph_col FROM scrambled ORDER BY id").rows
+
+      assert rows == [
+               ["m1", 1, "a1", "z1", "PH"],
+               ["m2", 2, "a2", "z2", "PH"]
+             ]
+    end
+  end
+
+  describe "Gap 4 — ON CONFLICT DO UPDATE ... WHERE (execution)" do
+    test "a conditional upsert updates only rows matching the predicate" do
+      {1, _} = EctoUnnest.insert_all(Repo, Event, %{user_id: [1], type: ["orig"]})
+
+      # predicate matches -> update applies
+      matching = from(e in Event, update: [set: [type: "revived"]], where: e.type == "orig")
+
+      {_, _} =
+        EctoUnnest.insert_all(Repo, Event, %{user_id: [1], type: ["x"]},
+          on_conflict: matching,
+          conflict_target: [:user_id]
+        )
+
+      assert Repo.get_by(Event, user_id: 1).type == "revived"
+
+      # predicate does not match -> row left as-is
+      non_matching = from(e in Event, update: [set: [type: "nope"]], where: e.type == "absent")
+
+      {_, _} =
+        EctoUnnest.insert_all(Repo, Event, %{user_id: [1], type: ["x"]},
+          on_conflict: non_matching,
+          conflict_target: [:user_id]
+        )
+
+      assert Repo.get_by(Event, user_id: 1).type == "revived"
     end
   end
 

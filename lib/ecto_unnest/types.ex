@@ -18,7 +18,7 @@ defmodule EctoUnnest.Types do
   end
 
   def ecto_type!(source, field, override) when is_binary(source) do
-    if is_binary(override) do
+    if override do
       # For a raw source we have no Ecto type; use :string as a neutral stand-in
       # (Postgrex receives the cast from the override anyway).
       :string
@@ -27,6 +27,19 @@ defmodule EctoUnnest.Types do
             "for source #{inspect(source)} pass the type of field #{inspect(field)} via :types"
     end
   end
+
+  @doc """
+  True when an Ecto type is stored as `jsonb` (a per-row value that must go in as
+  pre-encoded JSON text with a `::jsonb` cast in the projection — see `EctoUnnest`'s
+  JSON mode). Covers `:map`, `{:map, _}`, `{:array, :map}`, `{:array, {:map, _}}`
+  and parameterized types whose primitive is one of those.
+  """
+  def jsonb?(:map), do: true
+  def jsonb?({:map, _}), do: true
+  def jsonb?({:array, :map}), do: true
+  def jsonb?({:array, {:map, _}}), do: true
+  def jsonb?({:parameterized, _, _} = t), do: jsonb?(primitive(t))
+  def jsonb?(_), do: false
 
   @doc """
   `{:ok, "pg_type"}` or `{:error, :array_unsupported}`.

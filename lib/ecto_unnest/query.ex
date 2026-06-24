@@ -10,8 +10,11 @@ defmodule EctoUnnest.Query do
       built as an `%Ecto.Query.FromExpr{}` struct with properly alternating
       `raw`/`expr` parts (otherwise Ecto's `Inspect` blows up). The binding is
       named `:s`,
-    * the **`SELECT`** is assembled with `dynamic/2` via `from(b in base, select: ^sel)` —
-      `field(s, ^col)` for `unnest` columns, `type(^val, type)` for placeholders.
+    * the **`SELECT`** is assembled as a `%Ecto.Query.SelectExpr{}` struct (the same
+      shape Ecto compiles from `select: ^map`): `field(s, col)` for `unnest` columns,
+      `type(^val, type)` for placeholders, and `fragment` casts for JSON columns
+      (`f0."col"::jsonb`) and custom-typed placeholders (`$n::type`) — those need a
+      runtime cast string a `dynamic/2` `fragment/1` (literal-only) cannot express.
 
   Execution and all of `ON CONFLICT`/`RETURNING`/`prefix`/struct loading are
   delegated to `Ecto.Repo.insert_all/3`. `to_sql/1` renders the same plan into the
@@ -19,9 +22,10 @@ defmodule EctoUnnest.Query do
   `Ecto.Adapters.Postgres.Connection`.
   """
 
-  import Ecto.Query
-
   alias Ecto.Query.Planner
+  alias Ecto.Query.SelectExpr
+
+  require Ecto.Query
 
   @adapter Ecto.Adapters.Postgres
   @conn Ecto.Adapters.Postgres.Connection
@@ -40,18 +44,54 @@ defmodule EctoUnnest.Query do
 
   @doc "Builds the `%Ecto.Query{}` used as the source for `Repo.insert_all/3`."
   def build(plan) do
-    {arrays, scalars} = split(plan)
-
+    {arrays, _scalars} = split(plan)
     base = virtual(arrays, :s)
 
-    sel =
-      Map.merge(
-        Map.new(arrays, fn c -> {c.name, dynamic([s: s], field(s, ^c.name))} end),
-        Map.new(scalars, fn c -> {c.name, dynamic([s: s], type(^plan.placeholders[c.name], ^c.ecto_type))} end)
-      )
+    # Column order matches the map Ecto would build from `select: ^map` (keyed by
+    # name) so the INSERT header and projection stay byte-for-byte stable. JSON and
+    # custom-typed placeholders need a runtime cast string in the SELECT, which a
+    # `dynamic/2` `fragment/1` (literal-only) cannot express — so the `SelectExpr`
+    # is assembled by hand, the same struct Ecto would produce from the macro.
+    ordered = plan.columns |> Map.new(&{&1.name, &1}) |> Map.to_list() |> Enum.map(&elem(&1, 1))
 
-    from(b in base, select: ^sel)
+    {args, params, _i} =
+      Enum.reduce(ordered, {[], [], 0}, fn c, {args, params, i} ->
+        {expr, new_params, next} = select_entry(c, plan, i)
+        {args ++ [{c.name, expr}], params ++ new_params, next}
+      end)
+
+    select = %SelectExpr{
+      expr: {:%{}, [], args},
+      params: params,
+      take: %{},
+      subqueries: [],
+      aliases: %{},
+      line: __ENV__.line,
+      file: __ENV__.file
+    }
+
+    %{base | select: select}
   end
+
+  # A per-row JSON column: `f0."col"::jsonb` over a 1-D `text[]` of pre-encoded JSON.
+  defp select_entry(%{kind: :array, json: true, name: name}, _plan, i),
+    do: {{:fragment, [], [raw: "", expr: field_expr(name), raw: "::jsonb"]}, [], i}
+
+  # A plain `unnest` column: `f0."col"`.
+  defp select_entry(%{kind: :array, name: name}, _plan, i), do: {field_expr(name), [], i}
+
+  # A placeholder with a `:types` override: a raw `$n::type` cast on the parameter.
+  # The type is app-controlled (an atom/string from the caller), so it is rendered
+  # straight into the SQL — supporting custom PG types and binary-source casts.
+  defp select_entry(%{kind: :scalar, cast: {:raw, type}, name: name}, plan, i),
+    do: {{:fragment, [], [raw: "", expr: {:^, [], [i]}, raw: "::#{type}"]}, [{plan.placeholders[name], :any}], i + 1}
+
+  # A placeholder cast through its Ecto type: `type(^val, ecto_type)` (handles
+  # `Ecto.Enum`, dates, uuids on schema sources with no `:types` entry).
+  defp select_entry(%{kind: :scalar, cast: {:ecto, type}, name: name}, plan, i),
+    do: {{:type, [], [{:^, [], [i]}, type]}, [{plan.placeholders[name], type}], i + 1}
+
+  defp field_expr(name), do: {{:., [], [{:&, [], [0]}, name]}, [], []}
 
   @doc """
   `{sql, params}` of the full `INSERT` — without executing, purely.
@@ -106,8 +146,7 @@ defmodule EctoUnnest.Query do
   # ── INSERT header from the planned SELECT ──────────────────────────────
   # The SELECT is a map -> columns in the map's argument order (consistent with
   # the projection).
-  defp header(%Ecto.Query{select: %Ecto.Query.SelectExpr{expr: {:%{}, _, args}}}),
-    do: Enum.map(args, fn {field, _} -> field end)
+  defp header(%Ecto.Query{select: %SelectExpr{expr: {:%{}, _, args}}}), do: Enum.map(args, fn {field, _} -> field end)
 
   # ── ON CONFLICT (rebuild the planned form for Connection.insert) ────────
 
@@ -130,20 +169,28 @@ defmodule EctoUnnest.Query do
     end
 
     from = if is_atom(p.schema), do: {p.table, p.schema}, else: p.table
-    update_query = Ecto.Query.from(from, update: ^kw)
-
-    {planned, params, _} = Planner.plan(%{update_query | prefix: p.prefix}, :update_all, @adapter)
-    {cast_params, dump_params} = Enum.unzip(params)
-    {normalized, _} = Planner.normalize(planned, :update_all, @adapter, counter.())
-
-    {{normalized, dump_params, target(p)}, cast_params}
+    plan_update(Ecto.Query.from(from, update: ^kw), p, counter)
   end
+
+  # A full Ecto query as `:on_conflict` — a conditional `DO UPDATE ... WHERE ...`
+  # (`Ecto.Repo.insert_all/3` accepts the same). Planned as `:update_all`, exactly
+  # like the keyword form, so the `WHERE`/`ORDER BY` ride along into the rendered
+  # `ON CONFLICT` clause.
+  defp on_conflict(%{on_conflict: %Ecto.Query{} = query} = p, counter), do: plan_update(query, p, counter)
 
   defp on_conflict(%{on_conflict: other}, _counter) do
     raise ArgumentError,
           ":on_conflict #{inspect(other)} not supported — use " <>
             ":raise | :nothing | :replace_all | {:replace, fields} | " <>
-            "{:replace_all_except, fields} | [set: kw, inc: kw]"
+            "{:replace_all_except, fields} | [set: kw, inc: kw] | %Ecto.Query{}"
+  end
+
+  defp plan_update(update_query, p, counter) do
+    {planned, params, _} = Planner.plan(%{update_query | prefix: p.prefix}, :update_all, @adapter)
+    {cast_params, dump_params} = Enum.unzip(params)
+    {normalized, _} = Planner.normalize(planned, :update_all, @adapter, counter.())
+
+    {{normalized, dump_params, target(p)}, cast_params}
   end
 
   defp target(%{conflict_target: {:unsafe_fragment, _} = frag}), do: frag

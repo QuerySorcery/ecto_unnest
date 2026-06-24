@@ -38,9 +38,37 @@ defmodule EctoUnnest do
     * `:placeholders` — `%{col => value}` of constant columns (default `%{}`)
     * `:returning` — `true | false | [field]` (default `false`)
     * `:prefix` — schema prefix (overrides `@schema_prefix`)
-    * `:on_conflict` — `:raise | :nothing | :replace_all | {:replace, fields} | {:replace_all_except, fields} | [set: kw, inc: kw]`
+    * `:on_conflict` — `:raise | :nothing | :replace_all | {:replace, fields} |
+      {:replace_all_except, fields} | [set: kw, inc: kw] | Ecto.Query.t()`. A full
+      query enables a conditional `DO UPDATE ... WHERE ...` (see "Conflicts" below)
     * `:conflict_target` — `[col] | {:unsafe_fragment, binary}`
-    * `:types` — `%{col => "pg_type"}` override for type inference
+    * `:types` — `%{col => pg_type}` override for type inference, where `pg_type` is
+      an atom (recommended — assumed app-controlled, so rendered straight into the
+      SQL cast) or a string. For a placeholder it becomes a raw `::pg_type` cast, so
+      it can name a custom PG type (e.g. a domain `:kafka_topic_name`)
+    * `:json` — `[col]` columns to force into JSON mode (see "JSON columns" below)
+
+  ## JSON columns
+
+  A per-row value destined for a `jsonb` column (Ecto type `:map`, `{:map, _}` or
+  `{:array, :map}`) cannot ride in `unnest` as a `::jsonb[]` array — `unnest`
+  flattens multi-dimensional arrays and Postgrex would double-encode. Such columns
+  are shipped instead as a 1-D `text[]` of pre-encoded JSON with a `::jsonb` cast in
+  the projection. Schema sources detect this automatically from the Ecto type; on
+  binary sources use `types: %{col: :jsonb}` or `json: [:col]`. Raw terms are JSON
+  encoded with the configured `:postgrex` `:json_library`; already-encoded strings
+  pass through untouched.
+
+      EctoUnnest.insert_all(Repo, Doc,
+        %{id: [id1, id2], summary: [[%{"a" => 1}], [%{"b" => 2}]]},
+        placeholders: %{created_at: ts})
+
+  ## Conflicts
+
+  Besides the keyword form, `:on_conflict` accepts a full `Ecto.Query` (as
+  `Ecto.Repo.insert_all/3` does) for a conditional update:
+
+      from(s in Setting, update: [set: [deleted_at: nil]], where: not is_nil(s.deleted_at))
 
   ## Reading: virtual table
 
@@ -49,8 +77,10 @@ defmodule EctoUnnest do
 
   ## Limitations
 
-    * array-typed columns (`{:array, _}`) that vary per row are unsupported
-      (`unnest` flattens multi-dimensional arrays) — we raise a clear error,
+    * non-JSON array-typed columns (`{:array, _}` other than `{:array, :map}`) that
+      vary per row are unsupported (`unnest` flattens multi-dimensional arrays) — we
+      raise a clear error. JSON arrays (`{:array, :map}`) are supported via JSON mode
+      (see "JSON columns"),
     * binary sources (`"table"`) require `:types`, and `:returning` as a field list
       (no `__schema__`).
   """
@@ -183,6 +213,7 @@ defmodule EctoUnnest do
   # Deterministic column order (sorted by name) -> stable SQL.
   defp classify_columns!(schema, columns, placeholders, opts) do
     overrides = Map.new(opts[:types] || %{})
+    json_opt = MapSet.new(opts[:json] || [])
 
     array_cols = for k <- Map.keys(columns), do: {k, :array}
     scalar_cols = for k <- Map.keys(placeholders), do: {k, :scalar}
@@ -190,21 +221,61 @@ defmodule EctoUnnest do
     (array_cols ++ scalar_cols)
     |> Enum.sort_by(fn {name, _} -> name end)
     |> Enum.map(fn {name, kind} ->
-      ecto_type = EctoUnnest.Types.ecto_type!(schema, name, overrides[name])
-      pg_type = resolve_pg_type!(name, ecto_type, overrides[name], kind)
-      base = %{name: name, kind: kind, pg_type: pg_type, ecto_type: ecto_type}
-
-      if kind == :array do
-        # Schema -> dump arrays through the real Ecto type (UUID, Enum, datetime).
-        # Binary source -> the Ecto type is a `:string` stand-in, so pass values
-        # through untouched (`:any`) and let the `::pg_type[]` cast do the encoding.
-        dump_type = if is_binary(schema), do: :any, else: ecto_type
-        Map.merge(base, %{values: columns[name], dump_type: dump_type})
-      else
-        base
-      end
+      override = normalize_type(overrides[name])
+      ecto_type = EctoUnnest.Types.ecto_type!(schema, name, override)
+      classify_column!(schema, name, kind, ecto_type, override, columns, MapSet.member?(json_opt, name))
     end)
   end
+
+  # An `:array` (per-row) column whose value is itself JSON (jsonb/`{:array,:map}`).
+  # `unnest` flattens multi-dimensional arrays, so the only shape Postgres accepts
+  # is a 1-D `text[]` of pre-encoded JSON with a `::jsonb` cast in the projection.
+  defp classify_column!(schema, name, :array, ecto_type, override, columns, json?) do
+    base = %{name: name, kind: :array, ecto_type: ecto_type}
+
+    if json?(ecto_type, override, json?) do
+      Map.merge(base, %{
+        json: true,
+        pg_type: "text",
+        values: Enum.map(columns[name], &encode_json/1),
+        dump_type: :string
+      })
+    else
+      pg_type = resolve_pg_type!(name, ecto_type, override, :array)
+      # Schema -> dump arrays through the real Ecto type (UUID, Enum, datetime).
+      # Binary source -> the Ecto type is a `:string` stand-in, so pass values
+      # through untouched (`:any`) and let the `::pg_type[]` cast do the encoding.
+      dump_type = if is_binary(schema), do: :any, else: ecto_type
+      Map.merge(base, %{pg_type: pg_type, values: columns[name], dump_type: dump_type})
+    end
+  end
+
+  # Placeholders never go through `unnest`, so they need no `::pg_type[]` param
+  # cast — the value is a scalar parameter cast in the projection. `:types`, when
+  # given, becomes a raw `::type` cast on that parameter (supports custom PG types
+  # such as a domain `kafka_topic_name`, and non-string types on binary sources);
+  # otherwise the Ecto type drives the cast (so `Ecto.Enum`/date/uuid just work).
+  defp classify_column!(_schema, name, :scalar, ecto_type, override, _columns, _json?) do
+    cast = if override, do: {:raw, override}, else: {:ecto, ecto_type}
+    %{name: name, kind: :scalar, ecto_type: ecto_type, cast: cast}
+  end
+
+  defp json?(_ecto_type, _override, true), do: true
+  defp json?(_ecto_type, override, _json?) when override in ["jsonb", "json"], do: true
+  defp json?(ecto_type, nil, _json?), do: EctoUnnest.Types.jsonb?(ecto_type)
+  defp json?(_ecto_type, _override, _json?), do: false
+
+  # `:types` may be an atom (recommended — app-controlled, so it is safe to render
+  # straight into the SQL cast) or a string. Normalize to a string for rendering.
+  defp normalize_type(nil), do: nil
+  defp normalize_type(t) when is_atom(t), do: Atom.to_string(t)
+  defp normalize_type(t) when is_binary(t), do: t
+
+  defp encode_json(nil), do: nil
+  defp encode_json(v) when is_binary(v), do: v
+  defp encode_json(v), do: json_library().encode!(v)
+
+  defp json_library, do: Application.get_env(:postgrex, :json_library, JSON)
 
   defp resolve_pg_type!(name, ecto_type, override, kind) do
     case EctoUnnest.Types.resolve_pg_type(ecto_type, override, kind) do

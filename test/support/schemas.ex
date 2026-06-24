@@ -23,6 +23,21 @@ defmodule EctoUnnest.Test.WithUuid do
   end
 end
 
+defmodule EctoUnnest.Test.Doc do
+  @moduledoc false
+  use Ecto.Schema
+
+  # `summary` is `{:array, :map}` (a per-row JSON array), `meta` a plain jsonb map,
+  # `status` an integer-backed `Ecto.Enum`. Exercises JSON mode and enum placeholders.
+  @primary_key {:id, :id, autogenerate: true}
+  schema "docs" do
+    field(:summary, {:array, :map})
+    field(:meta, :map)
+    field(:status, Ecto.Enum, values: [draft: 0, published: 1, archived: 2])
+    field(:created_at, :utc_datetime)
+  end
+end
+
 defmodule EctoUnnest.Test.WithUuidV7 do
   @moduledoc false
   use Ecto.Schema

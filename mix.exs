@@ -30,7 +30,7 @@ defmodule EctoUnnest.MixProject do
     [
       {:ecto, "~> 3.10"},
       {:ecto_sql, "~> 3.10"},
-      {:styler, "~> 1.0"},
+      {:styler, "~> 1.0", only: :dev, runtime: false},
       {:postgrex, "~> 0.17", optional: true},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:uuuidv7, "~> 0.3.0", only: :test}
