@@ -324,5 +324,34 @@ defmodule EctoUnnest.IntegrationTest do
                  type: List.duplicate("a", 50)
                })
     end
+
+    test "distinct unnest shapes get distinct prepared-statement names" do
+      now = ~U[2026-06-17 10:00:00Z]
+
+      # Arity 2 and arity 3 into the same table: different SQL, so they must not
+      # share a prepared-statement cache slot (Ecto's table-only default would).
+      EctoUnnest.insert_all(Repo, Event, %{user_id: [1], type: ["a"]}, placeholders: %{inserted_at: now})
+
+      EctoUnnest.insert_all(Repo, Event, %{user_id: [2], type: ["b"], score: [9.9]}, placeholders: %{inserted_at: now})
+
+      names =
+        Repo.query!("SELECT name FROM pg_prepared_statements WHERE name LIKE 'ecto_unnest_all_events_%'").rows
+        |> List.flatten()
+        |> Enum.sort()
+
+      assert names == ["ecto_unnest_all_events_2", "ecto_unnest_all_events_3"]
+    end
+
+    test "an explicit :cache_statement overrides the default name" do
+      EctoUnnest.insert_all(Repo, Event, %{user_id: [1], type: ["a"]},
+        placeholders: %{inserted_at: ~U[2026-06-17 10:00:00Z]},
+        cache_statement: "my_custom_stmt"
+      )
+
+      %{rows: rows} =
+        Repo.query!("SELECT 1 FROM pg_prepared_statements WHERE name = 'my_custom_stmt'")
+
+      assert rows == [[1]]
+    end
   end
 end

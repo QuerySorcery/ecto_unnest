@@ -61,6 +61,8 @@ It is pure (no database connection) and renders the exact statement
 | `:on_conflict` | `:raise \| :nothing \| :replace_all \| {:replace, fields} \| {:replace_all_except, fields} \| [set: kw, inc: kw]` |
 | `:conflict_target` | `[col] \| {:unsafe_fragment, binary}` |
 | `:types` | `%{col => pg_type}` override for inference (atom or string — see [Type overrides](#type-overrides)) |
+| `:cache_statement` | prepared-statement cache name (default `"ecto_unnest_all_#{table}_#{arity}"`, where `arity` is the number of `unnest` columns; pass a binary to override, or `nil` for Ecto's default) |
+| `:require_all_fields` | `true` to assert every schema field is in the columns map or `:placeholders` (defaults to `config :ecto_unnest, :require_all_fields`, else `false`) |
 
 ## Type overrides and `:allowed_types`
 
