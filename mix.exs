@@ -38,8 +38,8 @@ defmodule EctoUnnest.MixProject do
   end
 
   defp description do
-    "Bulk insert dla Ecto przez unnest(...) — staly tekst SQL niezalezny od liczby " <>
-      "wierszy, przyjazny dla PgBouncera (transaction mode) i prepared statement cache."
+    "Bulk insert for Ecto via unnest(...) — constant SQL text independent of row " <>
+      "count, friendly to PgBouncer (transaction mode) and the prepared-statement cache."
   end
 
   defp package do
